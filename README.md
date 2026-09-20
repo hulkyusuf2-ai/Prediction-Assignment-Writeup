@@ -1,4 +1,4 @@
-# Practical Machine Learning – Course Project
+# Practical Machine Learning – Course Project 392
 
 Predicting the manner in which participants performed barbell lifts (`classe` A–E) from
 accelerometer data (Weight Lifting Exercise Dataset, Velloso et al., 2013).
