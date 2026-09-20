@@ -1,0 +1,206 @@
+<html><head><style>body {
+   color: black;
+}
+</style></head><body><p>title: &quot;Predicting Weight Lifting Technique from Wearable Sensor Data&quot;
+author: &quot;Your Name&quot;
+date: &quot;<code>r format(Sys.Date(), &#39;%B %d, %Y&#39;)</code>&quot;
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: readable</p>
+<pre><code><span class="hljs-string">keep_md:</span> <span class="hljs-literal">true</span>
+</code></pre><hr>
+<p>```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.5, cache = TRUE)</p>
+<pre><code>
+<span class="hljs-comment">## 1. Summary</span>
+
+Wearable devices make it easy to measure *how much* of an activity someone does, but rarely *how well* they <span class="hljs-keyword">do</span> it. This project uses the Weight Lifting Exercise Dataset (Velloso et al., <span class="hljs-number">2013</span>), <span class="hljs-keyword">in</span> which six participants performed dumbbell biceps curls <span class="hljs-keyword">while</span> wearing accelerometers on the **belt, forearm, arm <span class="hljs-keyword">and</span> dumbbell**. Each repetition was performed <span class="hljs-keyword">in</span> one of five ways, recorded <span class="hljs-keyword">in</span> the `classe` <span class="hljs-symbol">variable:</span>
+
+| Class | Manner of performing the lift |
+|<span class="hljs-symbol">:-----</span><span class="hljs-symbol">:|</span><span class="hljs-symbol">:------------------------------|</span>
+| A | Exactly according to the specification (correct) |
+| B | Throwing the elbows to the front |
+| C | Lifting the dumbbell only halfway |
+| D | Lowering the dumbbell only halfway |
+| E | Throwing the hips to the front |
+
+The goal is to predict `classe` from the sensor readings. I (<span class="hljs-number">1</span>) cleaned the data, (<span class="hljs-number">2</span>) held out <span class="hljs-number">30</span>% of the training data as a validation set, (<span class="hljs-number">3</span>) compared four model types using <span class="hljs-number">5</span>-fold cross-validation, (<span class="hljs-number">4</span>) estimated out-of-sample error on the untouched validation set, <span class="hljs-keyword">and</span> (<span class="hljs-number">5</span>) predicted the <span class="hljs-number">20</span> test cases.
+
+<span class="hljs-comment">## 2. Data loading</span>
+
+```{r load}
+library(caret)
+library(ggplot2)
+library(randomForest)
+
+train_url &lt;- <span class="hljs-string">"https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"</span>
+test_url  &lt;- <span class="hljs-string">"https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"</span>
+
+dir.create(<span class="hljs-string">"data"</span>, showWarnings = FALSE)
+if (!file.exists(<span class="hljs-string">"data/pml-training.csv"</span>)) download.file(train_url, <span class="hljs-string">"data/pml-training.csv"</span>)
+if (!file.exists(<span class="hljs-string">"data/pml-testing.csv"</span>))  download.file(test_url,  <span class="hljs-string">"data/pml-testing.csv"</span>)
+
+na_codes  &lt;- c(<span class="hljs-string">"NA"</span>, <span class="hljs-string">""</span>, <span class="hljs-string">"#DIV/0!"</span>)
+raw_train &lt;- read.csv(<span class="hljs-string">"data/pml-training.csv"</span>, na.strings = na_codes)
+raw_test  &lt;- read.csv(<span class="hljs-string">"data/pml-testing.csv"</span>,  na.strings = na_codes)
+
+dim(raw_train); dim(raw_test)
+</code></pre><p>The training set has <code>r nrow(raw_train)</code> observations and <code>r ncol(raw_train)</code> columns; the test set has only <code>r nrow(raw_test)</code> observations for which we must predict <code>classe</code>.</p>
+<h2 id="3-cleaning-and-feature-selection">3. Cleaning and feature selection</h2>
+<p>Several choices were made here, each with a reason:</p>
+<ol>
+<li><strong>Drop mostly-empty columns.</strong> Many columns are summary statistics (kurtosis, skewness, max, min, amplitude, variance, and so on) that are only filled in on a few rows (<code>new_window == &quot;yes&quot;</code>). They are more than 90% <code>NA</code> in the training data, and they are entirely <code>NA</code> in the 20 test cases, so they cannot help predict there anyway.</li>
+<li><strong>Drop identifiers and time variables</strong> (<code>X</code>, <code>user_name</code>, the timestamps, <code>new_window</code>, <code>num_window</code>). The rows are sorted by class and time, so the row index and window number would let a model &quot;predict&quot; <code>classe</code> almost perfectly on this dataset without learning anything about movement. Such a model would be useless on new lifts. I therefore use only the sensor measurements.</li>
+<li><strong>Drop near-zero-variance predictors</strong>, which carry almost no information.</li>
+</ol>
+<p>```{r clean}</p>
+<h1 id="1-columns-that-are-90-missing">1. columns that are &gt;90% missing</h1>
+<p>na_share &lt;- colMeans(is.na(raw_train))
+keep     &lt;- names(na_share)[na_share &lt; 0.90]
+train_clean &lt;- raw_train[, keep]</p>
+<h1 id="2-identifiers-time-stamps-would-leak-the-answer-">2. identifiers / time stamps (would leak the answer)</h1>
+<p>id_cols &lt;- c(&quot;X&quot;, &quot;user_name&quot;, &quot;raw_timestamp_part_1&quot;, &quot;raw_timestamp_part_2&quot;,
+             &quot;cvtd_timestamp&quot;, &quot;new_window&quot;, &quot;num_window&quot;)
+train_clean &lt;- train_clean[, !(names(train_clean) %in% id_cols)]
+train_clean$classe &lt;- factor(train_clean$classe)</p>
+<h1 id="3-near-zero-variance">3. near-zero variance</h1>
+<p>nzv &lt;- nearZeroVar(train_clean)
+if (length(nzv) &gt; 0) train_clean &lt;- train_clean[, -nzv]</p>
+<p>predictors &lt;- setdiff(names(train_clean), &quot;classe&quot;)</p>
+<h1 id="the-test-set-must-contain-every-predictor-with-no-missing-values">the test set must contain every predictor, with no missing values</h1>
+<p>stopifnot(all(predictors %in% names(raw_test)))
+stopifnot(!anyNA(raw_test[, predictors]))
+stopifnot(!anyNA(train_clean))</p>
+<pre><code>
+After cleaning, `r <span class="hljs-built_in">length</span>(predictors)` numeric sensor predictors remain <span class="hljs-keyword">and</span> there are no missing <span class="hljs-built_in">values</span>. No centering <span class="hljs-keyword">or</span> scaling <span class="hljs-built_in">is</span> needed because the models chosen (tree-based methods) are insensitive to <span class="hljs-built_in">feature</span> <span class="hljs-built_in">scale</span>; LDA <span class="hljs-built_in">is</span> the only exception <span class="hljs-keyword">and</span> it <span class="hljs-built_in">is</span> included only as a simple baseline.
+
+```{r fig-classes, fig.cap=<span class="hljs-string">"Figure 1. Distribution of the outcome classes in the training data. Class A is the most common, but no class is rare."</span>}
+ggplot(train_clean, aes(x = classe, fill = classe)) +
+  geom_bar(<span class="hljs-built_in">show</span>.<span class="hljs-built_in">legend</span> = FALSE) +
+  labs(x = <span class="hljs-string">"classe"</span>, y = <span class="hljs-string">"Number of observations"</span>) +
+  theme_minimal()
+</code></pre><p>The classes are reasonably balanced, so plain accuracy is an appropriate metric.</p>
+<h2 id="4-validation-strategy-and-cross-validation">4. Validation strategy and cross-validation</h2>
+<p>I split the cleaned training data 70/30 <strong>before</strong> fitting any model:</p>
+<ul>
+<li><strong>Training partition (70%)</strong> is used to fit and tune models. Inside it, I use <strong>5-fold cross-validation</strong> to compare models and choose tuning parameters. Five folds is a compromise: less variable than a single split, and far cheaper than 10-fold with repeats for a random forest on roughly 13,000 rows.</li>
+<li><strong>Validation partition (30%)</strong> is never used for fitting or tuning. It is used once, for the chosen model only, to get an honest estimate of out-of-sample error.</li>
+</ul>
+<p>```{r split}
+set.seed(2024)
+in_train &lt;- createDataPartition(train_clean$classe, p = 0.70, list = FALSE)
+training   &lt;- train_clean[in_train, ]
+validation &lt;- train_clean[-in_train, ]</p>
+<p>c(training = nrow(training), validation = nrow(validation))</p>
+<pre><code>
+## <span class="hljs-number">5</span>. Models
+
+I compared four models <span class="hljs-keyword">of</span> increasing flexibility:
+
+* **LDA**: a fast linear baseline.
+* **CART (`rpart`)**: a single, interpretable decision tree.
+* **Gradient boosted trees (`gbm`)**: sequentially fitted small trees.
+* **Random forest (`rf`)**: many decorrelated trees <span class="hljs-keyword">on</span> bootstrap samples, which handles many correlated, noisy sensor channels well <span class="hljs-keyword">and</span> needs little tuning.
+
+All models use the identical <span class="hljs-number">5</span>-fold CV folds (via the same `seeds`/`<span class="hljs-keyword">index</span>`) so their resampling results are directly comparable.
+
+```<span class="hljs-comment">{r models}</span>
+<span class="hljs-keyword">set</span>.seed(<span class="hljs-number">2024</span>)
+folds &lt;- createFolds(training$classe, k = <span class="hljs-number">5</span>, returnTrain = <span class="hljs-keyword">TRUE</span>)
+
+ctrl &lt;- trainControl(<span class="hljs-function"><span class="hljs-keyword">method</span> = "<span class="hljs-title">cv</span>", <span class="hljs-title">number</span> = 5, <span class="hljs-title">index</span> = <span class="hljs-title">folds</span>,
+                     <span class="hljs-title">allowParallel</span> = <span class="hljs-title">TRUE</span>)
+
+<span class="hljs-title">set</span>.<span class="hljs-title">seed</span><span class="hljs-params">(1)</span>;</span> m_lda  &lt;- train(classe ~ ., data = training, <span class="hljs-function"><span class="hljs-keyword">method</span> = "<span class="hljs-title">lda</span>",   <span class="hljs-title">trControl</span> = <span class="hljs-title">ctrl</span>)
+<span class="hljs-title">set</span>.<span class="hljs-title">seed</span><span class="hljs-params">(1)</span>;</span> m_rpart &lt;- train(classe ~ ., data = training, <span class="hljs-function"><span class="hljs-keyword">method</span> = "<span class="hljs-title">rpart</span>", <span class="hljs-title">trControl</span> = <span class="hljs-title">ctrl</span>,
+                              <span class="hljs-title">tuneLength</span> = 5)
+<span class="hljs-title">set</span>.<span class="hljs-title">seed</span><span class="hljs-params">(1)</span>;</span> m_gbm  &lt;- train(classe ~ ., data = training, <span class="hljs-function"><span class="hljs-keyword">method</span> = "<span class="hljs-title">gbm</span>",   <span class="hljs-title">trControl</span> = <span class="hljs-title">ctrl</span>,
+                             <span class="hljs-title">verbose</span> = <span class="hljs-title">FALSE</span>,
+                             <span class="hljs-title">tuneGrid</span> = <span class="hljs-title">expand</span>.<span class="hljs-title">grid</span><span class="hljs-params">(n.trees = 150, interaction.depth = 3,
+                                                    shrinkage = 0.1, n.minobsinnode = 10)</span>)
+<span class="hljs-title">set</span>.<span class="hljs-title">seed</span><span class="hljs-params">(1)</span>;</span> m_rf   &lt;- train(classe ~ ., data = training, <span class="hljs-function"><span class="hljs-keyword">method</span> = "<span class="hljs-title">rf</span>",    <span class="hljs-title">trControl</span> = <span class="hljs-title">ctrl</span>,
+                             <span class="hljs-title">ntree</span> = 250, <span class="hljs-title">tuneLength</span> = 3)
+
+<span class="hljs-title">models</span> &lt;- <span class="hljs-title">list</span><span class="hljs-params">(LDA = m_lda, CART = m_rpart, GBM = m_gbm, RF = m_rf)</span></span>
+</code></pre><h3 id="model-comparison-cross-validated-">Model comparison (cross-validated)</h3>
+<p>```{r fig-compare, fig.cap=&quot;Figure 2. 5-fold cross-validated accuracy for each model (points = fold results, with confidence intervals).&quot;}
+rs &lt;- resamples(models)
+dotplot(rs, metric = &quot;Accuracy&quot;)</p>
+<pre><code>
+```{r cv-table}
+cv_acc &lt;- sapply(models, <span class="hljs-function"><span class="hljs-keyword">function</span><span class="hljs-params">(m)</span> <span class="hljs-title">max</span><span class="hljs-params">(m$results$Accuracy)</span>)
+<span class="hljs-title">cv_tab</span> &lt;- <span class="hljs-title">data</span>.<span class="hljs-title">frame</span><span class="hljs-params">(Model = names<span class="hljs-params">(cv_acc)</span>,
+                     CV_Accuracy = round<span class="hljs-params">(cv_acc, <span class="hljs-number">4</span>)</span>,
+                     CV_Error = round<span class="hljs-params">(<span class="hljs-number">1</span> - cv_acc, <span class="hljs-number">4</span>)</span>)</span>
+<span class="hljs-title">rownames</span><span class="hljs-params">(cv_tab)</span> &lt;- <span class="hljs-title">NULL</span>
+<span class="hljs-title">cv_tab</span></span>
+</code></pre><p>```{r pick}
+best_name &lt;- names(which.max(cv_acc))
+best      &lt;- models[[best_name]]</p>
+<pre><code>
+The model <span class="hljs-keyword">with</span> <span class="hljs-keyword">the</span> best cross-validated accuracy <span class="hljs-keyword">is</span> **`r best_name`** (CV accuracy `r sprintf(<span class="hljs-string">"%.2f%%"</span>, <span class="hljs-number">100</span> * max(cv_acc))`, so a CV <span class="hljs-keyword">error</span> <span class="hljs-keyword">of</span> <span class="hljs-keyword">about</span> `r sprintf(<span class="hljs-string">"%.2f%%"</span>, <span class="hljs-number">100</span> * (<span class="hljs-number">1</span> - max(cv_acc)))`). I select <span class="hljs-keyword">it</span> because <span class="hljs-keyword">it</span> has <span class="hljs-keyword">the</span> highest accuracy across <span class="hljs-keyword">the</span> folds. Where two models are within noise <span class="hljs-keyword">of</span> each other, <span class="hljs-keyword">the</span> simpler <span class="hljs-keyword">or</span> faster one would be preferable, <span class="hljs-keyword">but</span> <span class="hljs-keyword">the</span> gap here <span class="hljs-keyword">is</span> decided <span class="hljs-keyword">by</span> <span class="hljs-keyword">the</span> table <span class="hljs-keyword">above</span> rather than <span class="hljs-keyword">by</span> assumption.
+
+Note <span class="hljs-keyword">that</span> these CV numbers were also used <span class="hljs-keyword">to</span> *choose* <span class="hljs-keyword">the</span> model, so they are slightly optimistic. That <span class="hljs-keyword">is</span> why <span class="hljs-keyword">the</span> validation partition <span class="hljs-keyword">is</span> kept separate.
+
+<span class="hljs-comment">## 6. Expected out-of-sample error</span>
+
+The chosen model <span class="hljs-keyword">is</span> now applied, once, <span class="hljs-keyword">to</span> <span class="hljs-keyword">the</span> <span class="hljs-number">30</span>% <span class="hljs-keyword">of</span> data <span class="hljs-keyword">it</span> has never seen:
+
+```{r validate}
+pred_val &lt;- predict(best, newdata = validation)
+cm &lt;- confusionMatrix(pred_val, validation$classe)
+cm$overall[c(<span class="hljs-string">"Accuracy"</span>, <span class="hljs-string">"Kappa"</span>, <span class="hljs-string">"AccuracyLower"</span>, <span class="hljs-string">"AccuracyUpper"</span>)]
+</code></pre><p>```{r oos, include=FALSE}
+acc     &lt;- unname(cm$overall[&quot;Accuracy&quot;])
+acc_lo  &lt;- unname(cm$overall[&quot;AccuracyLower&quot;])
+acc_hi  &lt;- unname(cm$overall[&quot;AccuracyUpper&quot;])
+oos_err &lt;- 1 - acc</p>
+<pre><code>
+* Validation accuracy: **`r sprintf(<span class="hljs-string">"%.2f%%"</span>, <span class="hljs-number">100</span> * acc)`** (<span class="hljs-number">95</span>% CI `r sprintf(<span class="hljs-string">"%.2f%%"</span>, <span class="hljs-number">100</span> * acc_lo)` to `r sprintf(<span class="hljs-string">"%.2f%%"</span>, <span class="hljs-number">100</span> * acc_hi)`).
+* **Expected out-<span class="hljs-keyword">of</span>-sample error: about `r sprintf(<span class="hljs-string">"%.2f%%"</span>, <span class="hljs-number">100</span> * oos_err)`** (<span class="hljs-number">95</span>% CI for the error: `r sprintf(<span class="hljs-string">"%.2f%%"</span>, <span class="hljs-number">100</span> * (<span class="hljs-number">1</span> - acc_hi))` to `r sprintf(<span class="hljs-string">"%.2f%%"</span>, <span class="hljs-number">100</span> * (<span class="hljs-number">1</span> - acc_lo))`).
+
+```{r fig-cm, fig.cap=<span class="hljs-string">"Figure 3. Confusion matrix on the held-out validation set (row-normalised proportions)."</span>}
+cm_df &lt;- <span class="hljs-keyword">as</span>.data.frame(cm$table)
+cm_df &lt;- transform(cm_df, Prop = Freq / ave(Freq, Reference, FUN = sum))
+ggplot(cm_df, aes(x = Reference, y = Prediction, fill = Prop)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf(<span class="hljs-string">"%.3f"</span>, Prop)), size = <span class="hljs-number">3</span>) +
+  scale_fill_gradient(low = <span class="hljs-string">"white"</span>, high = <span class="hljs-string">"steelblue"</span>) +
+  labs(fill = <span class="hljs-string">"Proportion"</span>) +
+  theme_minimal()
+</code></pre><p><strong>Caveat on the estimate.</strong> The validation set comes from the same six people and the same recording sessions as the training data. If the model were used on a <em>new</em> person, the error would likely be higher than this figure, because sensor placement and personal style differ between individuals. A stricter check, which I did not run here, would be leave-one-participant-out cross-validation. For the 20 test cases, which come from the same six participants, the estimate above is a reasonable guide.</p>
+<h2 id="7-what-drives-the-predictions-">7. What drives the predictions?</h2>
+<p>```{r fig-imp, fig.cap=&quot;Figure 4. The 15 most important predictors in the final model.&quot;, fig.height=5}
+plot(varImp(best), top = 15)</p>
+<pre><code>
+The most influential predictors come <span class="hljs-keyword">from</span> the belt, dumbbell and forearm sensors. This matches the physical <span class="hljs-keyword">definition</span> <span class="hljs-keyword">of</span> the classes: for example, throwing the hips forward (<span class="hljs-keyword">class</span> E) should show up <span class="hljs-keyword">in</span> the belt sensor, and incomplete lifts (C and D) <span class="hljs-keyword">in</span> the dumbbell and forearm.
+
+## <span class="hljs-number">8.</span> Predictions for the <span class="hljs-number">20</span> test cases
+
+```{r predict}
+test_x &lt;- raw_test[, predictors]
+test_pred &lt;- predict(best, newdata = test_x)
+
+results &lt;- data.frame(problem_id = raw_test$problem_id, prediction = test_pred)
+results
+</code></pre><p>The predictions are also written out as one file per problem, in the format used by the course prediction quiz:</p>
+<p><code>{r write}
+dir.create(&quot;predictions&quot;, showWarnings = FALSE)
+for (i in seq_along(test_pred)) {
+  writeLines(as.character(test_pred[i]),
+             file.path(&quot;predictions&quot;, paste0(&quot;problem_id_&quot;, raw_test$problem_id[i], &quot;.txt&quot;)),
+             sep = &quot;&quot;)
+}
+as.character(test_pred)</code></p>
+<h2 id="9-conclusions">9. Conclusions</h2>
+<ul>
+<li>Sensor readings alone (no identifiers or timestamps) are enough to classify the way a biceps curl was performed with very high accuracy.</li>
+<li>I compared four models with 5-fold CV, chose <strong><code>r best_name</code></strong>, and estimated its out-of-sample error at about <strong><code>r sprintf(&quot;%.2f%%&quot;, 100 * oos_err)</code></strong> on a held-out 30% of the data.</li>
+<li>The main limitation is that all data come from six participants, so performance on unseen people is likely lower than reported here.</li>
+</ul>
+<h2 id="references">References</h2>
+<p>Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. <em>Qualitative Activity Recognition of Weight Lifting Exercises.</em> Proceedings of the 4th International Conference in Cooperation with SIGCHI (Augmented Human &#39;13). Stuttgart, Germany: ACM SIGCHI, 2013. Data and description: <a href="http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har">http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har</a></p>
+</body></html>
