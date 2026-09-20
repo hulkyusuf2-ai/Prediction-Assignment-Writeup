@@ -1,0 +1,241 @@
+---
+title: "Predicting Weight Lifting Technique from Wearable Sensor Data"
+author: "Your Name"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: readable
+    keep_md: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.5, cache = TRUE)
+```
+
+## 1. Summary
+
+Wearable devices make it easy to measure *how much* of an activity someone does, but rarely *how well* they do it. This project uses the Weight Lifting Exercise Dataset (Velloso et al., 2013), in which six participants performed dumbbell biceps curls while wearing accelerometers on the **belt, forearm, arm and dumbbell**. Each repetition was performed in one of five ways, recorded in the `classe` variable:
+
+| Class | Manner of performing the lift |
+|:-----:|:------------------------------|
+| A | Exactly according to the specification (correct) |
+| B | Throwing the elbows to the front |
+| C | Lifting the dumbbell only halfway |
+| D | Lowering the dumbbell only halfway |
+| E | Throwing the hips to the front |
+
+The goal is to predict `classe` from the sensor readings. I (1) cleaned the data, (2) held out 30% of the training data as a validation set, (3) compared four model types using 5-fold cross-validation, (4) estimated out-of-sample error on the untouched validation set, and (5) predicted the 20 test cases.
+
+## 2. Data loading
+
+```{r load}
+library(caret)
+library(ggplot2)
+library(randomForest)
+
+train_url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+test_url  <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+dir.create("data", showWarnings = FALSE)
+if (!file.exists("data/pml-training.csv")) download.file(train_url, "data/pml-training.csv")
+if (!file.exists("data/pml-testing.csv"))  download.file(test_url,  "data/pml-testing.csv")
+
+na_codes  <- c("NA", "", "#DIV/0!")
+raw_train <- read.csv("data/pml-training.csv", na.strings = na_codes)
+raw_test  <- read.csv("data/pml-testing.csv",  na.strings = na_codes)
+
+dim(raw_train); dim(raw_test)
+```
+
+The training set has `r nrow(raw_train)` observations and `r ncol(raw_train)` columns; the test set has only `r nrow(raw_test)` observations for which we must predict `classe`.
+
+## 3. Cleaning and feature selection
+
+Several choices were made here, each with a reason:
+
+1. **Drop mostly-empty columns.** Many columns are summary statistics (kurtosis, skewness, max, min, amplitude, variance, and so on) that are only filled in on a few rows (`new_window == "yes"`). They are more than 90% `NA` in the training data, and they are entirely `NA` in the 20 test cases, so they cannot help predict there anyway.
+2. **Drop identifiers and time variables** (`X`, `user_name`, the timestamps, `new_window`, `num_window`). The rows are sorted by class and time, so the row index and window number would let a model "predict" `classe` almost perfectly on this dataset without learning anything about movement. Such a model would be useless on new lifts. I therefore use only the sensor measurements.
+3. **Drop near-zero-variance predictors**, which carry almost no information.
+
+```{r clean}
+# 1. columns that are >90% missing
+na_share <- colMeans(is.na(raw_train))
+keep     <- names(na_share)[na_share < 0.90]
+train_clean <- raw_train[, keep]
+
+# 2. identifiers / time stamps (would leak the answer)
+id_cols <- c("X", "user_name", "raw_timestamp_part_1", "raw_timestamp_part_2",
+             "cvtd_timestamp", "new_window", "num_window")
+train_clean <- train_clean[, !(names(train_clean) %in% id_cols)]
+train_clean$classe <- factor(train_clean$classe)
+
+# 3. near-zero variance
+nzv <- nearZeroVar(train_clean)
+if (length(nzv) > 0) train_clean <- train_clean[, -nzv]
+
+predictors <- setdiff(names(train_clean), "classe")
+
+# the test set must contain every predictor, with no missing values
+stopifnot(all(predictors %in% names(raw_test)))
+stopifnot(!anyNA(raw_test[, predictors]))
+stopifnot(!anyNA(train_clean))
+```
+
+After cleaning, `r length(predictors)` numeric sensor predictors remain and there are no missing values. No centering or scaling is needed because the models chosen (tree-based methods) are insensitive to feature scale; LDA is the only exception and it is included only as a simple baseline.
+
+```{r fig-classes, fig.cap="Figure 1. Distribution of the outcome classes in the training data. Class A is the most common, but no class is rare."}
+ggplot(train_clean, aes(x = classe, fill = classe)) +
+  geom_bar(show.legend = FALSE) +
+  labs(x = "classe", y = "Number of observations") +
+  theme_minimal()
+```
+
+The classes are reasonably balanced, so plain accuracy is an appropriate metric.
+
+## 4. Validation strategy and cross-validation
+
+I split the cleaned training data 70/30 **before** fitting any model:
+
+* **Training partition (70%)** is used to fit and tune models. Inside it, I use **5-fold cross-validation** to compare models and choose tuning parameters. Five folds is a compromise: less variable than a single split, and far cheaper than 10-fold with repeats for a random forest on roughly 13,000 rows.
+* **Validation partition (30%)** is never used for fitting or tuning. It is used once, for the chosen model only, to get an honest estimate of out-of-sample error.
+
+```{r split}
+set.seed(2024)
+in_train <- createDataPartition(train_clean$classe, p = 0.70, list = FALSE)
+training   <- train_clean[in_train, ]
+validation <- train_clean[-in_train, ]
+
+c(training = nrow(training), validation = nrow(validation))
+```
+
+## 5. Models
+
+I compared four models of increasing flexibility:
+
+* **LDA**: a fast linear baseline.
+* **CART (`rpart`)**: a single, interpretable decision tree.
+* **Gradient boosted trees (`gbm`)**: sequentially fitted small trees.
+* **Random forest (`rf`)**: many decorrelated trees on bootstrap samples, which handles many correlated, noisy sensor channels well and needs little tuning.
+
+All models use the identical 5-fold CV folds (via the same `seeds`/`index`) so their resampling results are directly comparable.
+
+```{r models}
+set.seed(2024)
+folds <- createFolds(training$classe, k = 5, returnTrain = TRUE)
+
+ctrl <- trainControl(method = "cv", number = 5, index = folds,
+                     allowParallel = TRUE)
+
+set.seed(1); m_lda  <- train(classe ~ ., data = training, method = "lda",   trControl = ctrl)
+set.seed(1); m_rpart <- train(classe ~ ., data = training, method = "rpart", trControl = ctrl,
+                              tuneLength = 5)
+set.seed(1); m_gbm  <- train(classe ~ ., data = training, method = "gbm",   trControl = ctrl,
+                             verbose = FALSE,
+                             tuneGrid = expand.grid(n.trees = 150, interaction.depth = 3,
+                                                    shrinkage = 0.1, n.minobsinnode = 10))
+set.seed(1); m_rf   <- train(classe ~ ., data = training, method = "rf",    trControl = ctrl,
+                             ntree = 250, tuneLength = 3)
+
+models <- list(LDA = m_lda, CART = m_rpart, GBM = m_gbm, RF = m_rf)
+```
+
+### Model comparison (cross-validated)
+
+```{r fig-compare, fig.cap="Figure 2. 5-fold cross-validated accuracy for each model (points = fold results, with confidence intervals)."}
+rs <- resamples(models)
+dotplot(rs, metric = "Accuracy")
+```
+
+```{r cv-table}
+cv_acc <- sapply(models, function(m) max(m$results$Accuracy))
+cv_tab <- data.frame(Model = names(cv_acc),
+                     CV_Accuracy = round(cv_acc, 4),
+                     CV_Error = round(1 - cv_acc, 4))
+rownames(cv_tab) <- NULL
+cv_tab
+```
+
+```{r pick}
+best_name <- names(which.max(cv_acc))
+best      <- models[[best_name]]
+```
+
+The model with the best cross-validated accuracy is **`r best_name`** (CV accuracy `r sprintf("%.2f%%", 100 * max(cv_acc))`, so a CV error of about `r sprintf("%.2f%%", 100 * (1 - max(cv_acc)))`). I select it because it has the highest accuracy across the folds. Where two models are within noise of each other, the simpler or faster one would be preferable, but the gap here is decided by the table above rather than by assumption.
+
+Note that these CV numbers were also used to *choose* the model, so they are slightly optimistic. That is why the validation partition is kept separate.
+
+## 6. Expected out-of-sample error
+
+The chosen model is now applied, once, to the 30% of data it has never seen:
+
+```{r validate}
+pred_val <- predict(best, newdata = validation)
+cm <- confusionMatrix(pred_val, validation$classe)
+cm$overall[c("Accuracy", "Kappa", "AccuracyLower", "AccuracyUpper")]
+```
+
+```{r oos, include=FALSE}
+acc     <- unname(cm$overall["Accuracy"])
+acc_lo  <- unname(cm$overall["AccuracyLower"])
+acc_hi  <- unname(cm$overall["AccuracyUpper"])
+oos_err <- 1 - acc
+```
+
+* Validation accuracy: **`r sprintf("%.2f%%", 100 * acc)`** (95% CI `r sprintf("%.2f%%", 100 * acc_lo)` to `r sprintf("%.2f%%", 100 * acc_hi)`).
+* **Expected out-of-sample error: about `r sprintf("%.2f%%", 100 * oos_err)`** (95% CI for the error: `r sprintf("%.2f%%", 100 * (1 - acc_hi))` to `r sprintf("%.2f%%", 100 * (1 - acc_lo))`).
+
+```{r fig-cm, fig.cap="Figure 3. Confusion matrix on the held-out validation set (row-normalised proportions)."}
+cm_df <- as.data.frame(cm$table)
+cm_df <- transform(cm_df, Prop = Freq / ave(Freq, Reference, FUN = sum))
+ggplot(cm_df, aes(x = Reference, y = Prediction, fill = Prop)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.3f", Prop)), size = 3) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(fill = "Proportion") +
+  theme_minimal()
+```
+
+**Caveat on the estimate.** The validation set comes from the same six people and the same recording sessions as the training data. If the model were used on a *new* person, the error would likely be higher than this figure, because sensor placement and personal style differ between individuals. A stricter check, which I did not run here, would be leave-one-participant-out cross-validation. For the 20 test cases, which come from the same six participants, the estimate above is a reasonable guide.
+
+## 7. What drives the predictions?
+
+```{r fig-imp, fig.cap="Figure 4. The 15 most important predictors in the final model.", fig.height=5}
+plot(varImp(best), top = 15)
+```
+
+The most influential predictors come from the belt, dumbbell and forearm sensors. This matches the physical definition of the classes: for example, throwing the hips forward (class E) should show up in the belt sensor, and incomplete lifts (C and D) in the dumbbell and forearm.
+
+## 8. Predictions for the 20 test cases
+
+```{r predict}
+test_x <- raw_test[, predictors]
+test_pred <- predict(best, newdata = test_x)
+
+results <- data.frame(problem_id = raw_test$problem_id, prediction = test_pred)
+results
+```
+
+The predictions are also written out as one file per problem, in the format used by the course prediction quiz:
+
+```{r write}
+dir.create("predictions", showWarnings = FALSE)
+for (i in seq_along(test_pred)) {
+  writeLines(as.character(test_pred[i]),
+             file.path("predictions", paste0("problem_id_", raw_test$problem_id[i], ".txt")),
+             sep = "")
+}
+as.character(test_pred)
+```
+
+## 9. Conclusions
+
+* Sensor readings alone (no identifiers or timestamps) are enough to classify the way a biceps curl was performed with very high accuracy.
+* I compared four models with 5-fold CV, chose **`r best_name`**, and estimated its out-of-sample error at about **`r sprintf("%.2f%%", 100 * oos_err)`** on a held-out 30% of the data.
+* The main limitation is that all data come from six participants, so performance on unseen people is likely lower than reported here.
+
+## References
+
+Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. *Qualitative Activity Recognition of Weight Lifting Exercises.* Proceedings of the 4th International Conference in Cooperation with SIGCHI (Augmented Human '13). Stuttgart, Germany: ACM SIGCHI, 2013. Data and description: http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har
